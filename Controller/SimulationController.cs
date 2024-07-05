@@ -2,6 +2,7 @@
 using Microsoft.AspNetCore.Mvc;
 using SimBackend.Model;
 using SimBackend.Services;
+using SimBackend.Interfaces;
 using System.Threading.Tasks;
 
 namespace SimBackend.Controllers
@@ -11,9 +12,9 @@ namespace SimBackend.Controllers
     public class SimulationController : ControllerBase
     {
         private readonly ISimulationService _simulationService;
-        private readonly OrderSubscriberService _orderSubscriberService;
+        private readonly IOrderSubscriberService _orderSubscriberService;
 
-        public SimulationController(ISimulationService simulationService, OrderSubscriberService orderSubscriberService)
+        public SimulationController(ISimulationService simulationService, IOrderSubscriberService orderSubscriberService)
         {
             _simulationService = simulationService;
             _orderSubscriberService = orderSubscriberService;

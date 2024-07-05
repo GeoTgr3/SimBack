@@ -1,16 +1,14 @@
-using Microsoft.OpenApi.Models;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using SimBackend.Services;
+using Microsoft.OpenApi.Models;
+using SimBackend.Interfaces;
 using SimBackend.Services;
 using System.Text.Json.Serialization;
-using SimBackend.Interfaces;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container
 builder.Services.AddHttpClient(); // Register HttpClient
-//builder.Services.AddAuthorization(); // Register authorization services
 builder.Services.AddControllers().AddJsonOptions(x =>
                 x.JsonSerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles);
 // Add Swagger services
@@ -21,14 +19,15 @@ builder.Services.AddSwaggerGen(c =>
 
 builder.Services.AddSingleton<IRabbitMqService, RabbitMqService>();
 builder.Services.AddSingleton<IOrderService, OrderService>();
-builder.Services.AddSingleton<ISimulationService, SimulationService>(); // Add your ISimulationService implementation
-builder.Services.AddSingleton<IOrderSubscriberService, OrderSubscriberService>(); // Add your ISimulationService implementation
+builder.Services.AddSingleton<ISimulationService, SimulationService>();
 
-
-builder.Services.AddHostedService<OrderSubscriberService>(); // Register as a hosted service
-
-
-
+// Register OrderSubscriberService as both hosted service and singleton
+builder.Services.AddSingleton<OrderSubscriberService>();
+builder.Services.AddSingleton<IOrderSubscriberService>(provider =>
+{
+    return provider.GetRequiredService<OrderSubscriberService>();
+});
+builder.Services.AddHostedService(provider => provider.GetRequiredService<OrderSubscriberService>());
 
 const string MyAllowSpecificOrigins = "_myAllowSpecificOrigins";
 
@@ -43,6 +42,7 @@ builder.Services.AddCors(options =>
                    .AllowCredentials();
         });
 });
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline
@@ -60,11 +60,7 @@ app.UseHttpsRedirection();
 app.UseStaticFiles();
 
 app.UseRouting();
-
-//app.UseAuthentication();
 app.UseCors("_myAllowSpecificOrigins");
-
-//app.UseAuthorization();
 
 // Enable middleware to serve generated Swagger as a JSON endpoint
 app.UseSwagger();
@@ -72,7 +68,7 @@ app.UseSwagger();
 // Enable middleware to serve Swagger UI
 app.UseSwaggerUI(c =>
 {
-    c.SwaggerEndpoint("../swagger/v1/swagger.json", "My API V1");
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "My API V1");
 });
 
 app.MapControllers();
