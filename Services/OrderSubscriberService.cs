@@ -1,16 +1,16 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using SimBackend.Interfaces;
 using SimBackend.Model.DTO;
-using SimBackend.Services;
-
 using static SimBackend.Model.Concepts;
 
 namespace SimBackend.Services
@@ -20,20 +20,22 @@ namespace SimBackend.Services
         private readonly IRabbitMqService _rabbitMqService;
         private readonly HttpClient _httpClient;
         private readonly List<int> _coinUpdates = new List<int>();
-        private string _token;
+        private readonly ILogger<OrderSubscriberService> _logger;
         private readonly ISimulationService _simulationService;
-
+        private string _token;
+        private SemaphoreSlim _semaphore;
 
         public OrderSubscriberService(
             IRabbitMqService rabbitMqService,
-                        ISimulationService simulationService,
-
-            HttpClient httpClient)
+            ISimulationService simulationService,
+            HttpClient httpClient,
+            ILogger<OrderSubscriberService> logger)
         {
             _rabbitMqService = rabbitMqService;
             _httpClient = httpClient;
             _simulationService = simulationService;
-
+            _logger = logger;
+            _semaphore = new SemaphoreSlim(1, 1);
         }
 
         public void SetToken(string token)
@@ -41,102 +43,156 @@ namespace SimBackend.Services
             _token = token;
         }
 
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
-{
-    Console.WriteLine("OrderSubscriberService is starting.");
-
-    _rabbitMqService.Subscribe(async order =>
-    {
-        if (stoppingToken.IsCancellationRequested)
-            return;
-
-        Console.WriteLine($"Message received: Order ID = {order?.Id}, OriginNodeId = {order?.OriginNodeId}, TargetNodeId = {order?.TargetNodeId}");
-
-        bool accepted = new Random().Next(2) == 0;
-        Console.WriteLine($"Order {order.Id} acceptance status: {accepted}");
-        if (accepted)
+        private async Task<HttpResponseMessage> AcceptOrder(int orderId)
         {
-            await AcceptOrder(order);
-            int transporterId = _simulationService.GetTransporterId();
-            if (transporterId != 0)
-            {
-                await MoveTransporter(order, transporterId);
-                int coins = CalculateOrderValue(order);
-                Console.WriteLine($"Order {order.Id} processed. Coins earned: {coins}");
-                _coinUpdates.Add(coins); // Store the coin updates
-            }
+            _logger.LogInformation($"Accepting order {orderId}");
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+            return await _httpClient.PostAsync($"https://localhost:7115/Order/Accept?orderId={orderId}", null);
         }
-    });
+
+        protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("OrderSubscriberService is starting.");
+
+            _rabbitMqService.Subscribe(async message =>
+            {
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation("Stopping token is requested. Exiting.");
+                    return;
+                }
+
+                // Log the raw message received
+                _logger.LogInformation($"Raw message received: {message}");
+
+                await _semaphore.WaitAsync(stoppingToken); // Wait for the semaphore
+
+                try
+                {
+                    var orderJson = JsonNode.Parse(message);
+                    if (orderJson == null)
+                    {
+                        throw new Exception("Order deserialization resulted in null");
+                    }
+
+                    // Extract values from JSON
+                    int orderId = orderJson["id"]?.GetValue<int>() ?? 0;
+                    int originNodeId = orderJson["originNodeId"]?.GetValue<int>() ?? 0;
+                    int targetNodeId = orderJson["targetNodeId"]?.GetValue<int>() ?? 0;
+                    int load = orderJson["load"]?.GetValue<int>() ?? 0;
+                    int value = orderJson["value"]?.GetValue<int>() ?? 0;
+                    string deliveryDateUtc = orderJson["deliveryDateUtc"]?.GetValue<string>() ?? "";
+                    string expirationDateUtc = orderJson["expirationDateUtc"]?.GetValue<string>() ?? "";
+
+                    _logger.LogInformation($"Message received: Order ID = {orderId}, OriginNodeId = {originNodeId}, TargetNodeId = {targetNodeId}");
+
+                    bool accepted = new Random().Next(2) == 0;
+                    _logger.LogInformation($"Order {orderId} acceptance status: {accepted}");
+                    if (accepted)
+                    {
+                        var acceptResponse = await AcceptOrder(orderId);
+                        if (acceptResponse.IsSuccessStatusCode)
+                        {
+                            int transporterId = _simulationService.GetTransporterId();
+                            if (transporterId != 0)
+                            {
+                                var transporterSuccess = await MoveTransporter(orderId, transporterId, originNodeId, targetNodeId);
+                                if (transporterSuccess)
+                                {
+                                    int coins = CalculateOrderValue(value, deliveryDateUtc, expirationDateUtc);
+                                    _logger.LogInformation($"Order {orderId} processed. Coins earned: {coins}");
+                                    _coinUpdates.Add(coins); // Store the coin updates
+                                }
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogError($"Order {orderId} acceptance failed with status code: {acceptResponse.StatusCode}");
+                            if (acceptResponse.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                            {
+                                _logger.LogError("Unauthorized access. Please check the token.");
+                                // Handle token refresh if needed
+                            }
+                        }
+                    }
+                }
+                catch (JsonException jsonEx)
+                {
+                    _logger.LogError($"JSON deserialization error: {jsonEx.Message}");
+                    _logger.LogError($"JSON payload: {message}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Unexpected error during deserialization: {ex.Message}");
+                }
+                finally
+                {
+                    _semaphore.Release(); // Release the semaphore
+                }
+            });
 
             return Task.CompletedTask;
         }
 
 
-
-        private async Task AcceptOrder(OrderDto order)
+        private async Task<bool> MoveTransporter(int orderId, int transporterId, int originNodeId, int targetNodeId)
         {
-            if (order == null)
-            {
-                Console.WriteLine("Error: Order is null.");
-                return;
-            }
-
-            Console.WriteLine($"Accepting order {order.Id}");
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _token);
-            var response = await _httpClient.PostAsync($"https://localhost:7115/Order/Accept?orderId={order.Id}", null);
-            Console.WriteLine($"Order {order.Id} acceptance response: {response.StatusCode}");
-        }
-
-        private async Task MoveTransporter(OrderDto order, int transporterId)
-        {
-            if (order == null)
-            {
-                Console.WriteLine("Error: Order is null.");
-                return;
-            }
-
-            Console.WriteLine($"Moving transporter for order {order.Id}");
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _token);
-
-            // Fetch the current position of the transporter
             var transporterResponse = await _httpClient.GetAsync($"https://localhost:7115/CargoTransporter/Get?transporterId={transporterId}");
             if (!transporterResponse.IsSuccessStatusCode)
             {
-                Console.WriteLine($"Failed to get transporter {transporterId}. Status code: {transporterResponse.StatusCode}");
-                return;
+                _logger.LogError($"Failed to get transporter {transporterId}. Status code: {transporterResponse.StatusCode}");
+                return false;
             }
 
             var transporterContent = await transporterResponse.Content.ReadAsStringAsync();
-            Console.WriteLine($"Transporter response content: {transporterContent}");
-
-            // Ensure that the response content is valid JSON
-            if (string.IsNullOrWhiteSpace(transporterContent))
-            {
-                Console.WriteLine("Error: Transporter response content is empty or invalid.");
-                return;
-            }
+            _logger.LogInformation($"Transporter response content: {transporterContent}");
 
             var transporter = JsonSerializer.Deserialize<CargoTransporterDto>(transporterContent);
             if (transporter == null)
             {
-                Console.WriteLine("Error: Transporter is null or could not be deserialized.");
-                return;
+                _logger.LogError("Error: Transporter is null or could not be deserialized.");
+                return false;
+            }
+
+            if (transporter.InTransit)
+            {
+                _logger.LogError($"Transporter {transporterId} is currently in transit and cannot move.");
+                return false;
             }
 
             var currentPos = transporter.PositionNodeId;
-            var targetNode = order.TargetNodeId;
+            _logger.LogInformation($"Current position of transporter {transporterId}: {currentPos}");
 
-            if (currentPos != -1 && targetNode != -1)
+            var path = await GetPath(currentPos, targetNodeId);
+            if (path.Count == 0)
             {
-                var path = await GetPath(currentPos, targetNode);
-                foreach (var nodeId in path)
+                _logger.LogError($"No path found from node {currentPos} to node {targetNodeId}");
+                return false;
+            }
+
+            foreach (var nodeId in path.Skip(1))
+            {
+                _logger.LogInformation($"Sending move request: https://localhost:7115/CargoTransporter/Move?transporterId={transporterId}&targetNodeId={nodeId}");
+                await Task.Delay(1000);
+
+                var moveResponse = await _httpClient.PutAsync($"https://localhost:7115/CargoTransporter/Move?transporterId={transporterId}&targetNodeId={nodeId}", null);
+                var moveContent = await moveResponse.Content.ReadAsStringAsync();
+                _logger.LogInformation($"Moved transporter to node {nodeId}. Response: {moveResponse.StatusCode}, Content: {moveContent}");
+
+                if (!moveResponse.IsSuccessStatusCode)
                 {
-                    await Task.Delay(1000); // Simulate movement delay
-                    var moveResponse = await _httpClient.PutAsync($"https://localhost:7115/CargoTransporter/Move?transporterId={transporter.Id}&targetNodeId={nodeId}", null);
-                    Console.WriteLine($"Moved transporter to node {nodeId}. Response: {moveResponse.StatusCode}");
+                    _logger.LogError($"Failed to move transporter to node {nodeId}. Status code: {moveResponse.StatusCode}, Response content: {moveContent}");
+                    return false;
                 }
             }
+
+            return true;
         }
+
+
+
+
+
 
 
 
@@ -176,7 +232,13 @@ namespace SimBackend.Services
                         if (!unvisitedNodes.Contains(neighbor))
                             continue;
 
-                        var edge = grid.Edges.First(e => e.Id == connection.EdgeId);
+                        var edge = grid.Edges.FirstOrDefault(e => e.Id == connection.EdgeId);
+                        if (edge == null)
+                        {
+                            _logger.LogWarning($"Edge with ID {connection.EdgeId} not found.");
+                            continue;
+                        }
+
                         var newDist = distances[currentNode] + edge.Cost;
                         if (newDist < distances[neighbor])
                         {
@@ -196,40 +258,112 @@ namespace SimBackend.Services
             }
             path.Insert(0, startNodeId);
 
+            if (path.First() != startNodeId || path.Last() != endNodeId)
+            {
+                _logger.LogError("The calculated path does not start at the start node or end at the end node.");
+                return new List<int>();
+            }
+
+            _logger.LogInformation($"Calculated path: {string.Join(" -> ", path)}");
             return path;
         }
+
 
         private async Task<List<int>> GetPath(int startNodeId, int endNodeId)
         {
             var gridResponse = await _httpClient.GetAsync("https://localhost:7115/Grid/Get");
-            var grid = JsonSerializer.Deserialize<Grid>(await gridResponse.Content.ReadAsStringAsync());
-            return Dijkstra(grid, startNodeId, endNodeId);
+            if (!gridResponse.IsSuccessStatusCode)
+            {
+                _logger.LogError($"Failed to get grid data. Status code: {gridResponse.StatusCode}");
+                return new List<int>();
+            }
+
+            var gridContent = await gridResponse.Content.ReadAsStringAsync();
+
+            JsonNode? grid;
+            try
+            {
+                grid = JsonNode.Parse(gridContent);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error parsing grid JSON: {ex.Message}");
+                return new List<int>();
+            }
+
+            if (grid == null)
+            {
+                _logger.LogError("Error: Grid JSON is null.");
+                return new List<int>();
+            }
+
+            var nodesJson = grid["Nodes"]?.AsArray();
+            var edgesJson = grid["Edges"]?.AsArray();
+            var connectionsJson = grid["Connections"]?.AsArray();
+
+            if (nodesJson == null || edgesJson == null || connectionsJson == null)
+            {
+                if (nodesJson == null) _logger.LogError("Error: Missing nodes in the grid JSON.");
+                if (edgesJson == null) _logger.LogError("Error: Missing edges in the grid JSON.");
+                if (connectionsJson == null) _logger.LogError("Error: Missing connections in the grid JSON.");
+                return new List<int>();
+            }
+
+            var gridObject = new Grid
+            {
+                Nodes = nodesJson.Select(node => new Node
+                {
+                    Id = node["Id"]?.GetValue<int>() ?? -1,
+                }).Where(n => n.Id != -1).ToList(),
+                Edges = edgesJson.Select(edge => new Edge
+                {
+                    Id = edge["Id"]?.GetValue<int>() ?? -1,
+                    Cost = edge["Cost"]?.GetValue<int>() ?? -1,
+                }).Where(e => e.Id != -1 && e.Cost != -1).ToList(),
+                Connections = connectionsJson.Select(conn => new Connection
+                {
+                    FirstNodeId = conn["FirstNodeId"]?.GetValue<int>() ?? -1,
+                    SecondNodeId = conn["SecondNodeId"]?.GetValue<int>() ?? -1,
+                    EdgeId = conn["EdgeId"]?.GetValue<int>() ?? -1,
+                }).Where(c => c.FirstNodeId != -1 && c.SecondNodeId != -1 && c.EdgeId != -1).ToList()
+            };
+
+            _logger.LogInformation($"Deserialized Grid: Nodes={gridObject.Nodes.Count}, Edges={gridObject.Edges.Count}, Connections={gridObject.Connections.Count}");
+
+            return Dijkstra(gridObject, startNodeId, endNodeId);
         }
 
 
-        private int CalculateOrderValue(OrderDto order)
+
+
+
+
+
+
+
+        private int CalculateOrderValue(int value, string deliveryDateUtc, string expirationDateUtc)
         {
-            if (string.IsNullOrEmpty(order.ExpirationDateUtc) || string.IsNullOrEmpty(order.DeliveryDateUtc))
+            if (string.IsNullOrEmpty(expirationDateUtc) || string.IsNullOrEmpty(deliveryDateUtc))
             {
-                Console.WriteLine("Error: ExpirationDateUtc or DeliveryDateUtc is null or empty");
+                _logger.LogError("Error: ExpirationDateUtc or DeliveryDateUtc is null or empty");
                 return 0;
             }
 
-            DateTime expirationDateUtc = DateTime.Parse(order.ExpirationDateUtc);
-            DateTime deliveryDateUtc = DateTime.Parse(order.DeliveryDateUtc);
-            TimeSpan timeToDeliver = expirationDateUtc - DateTime.UtcNow;
+            DateTime expirationDate = DateTime.Parse(expirationDateUtc);
+            DateTime deliveryDate = DateTime.Parse(deliveryDateUtc);
+            TimeSpan timeToDeliver = expirationDate - DateTime.UtcNow;
 
             if (timeToDeliver.TotalMinutes > 0)
             {
-                Console.WriteLine($"Order {order.Id} delivered on time. Value: {order.Value}");
-                return order.Value;
+                _logger.LogInformation($"Order delivered on time. Value: {value}");
+                return value;
             }
             else
             {
                 // Apply a penalty for late delivery
                 double penaltyPercentage = 0.5; // Example: 50% penalty
-                int valueAfterPenalty = (int)(order.Value * (1 - penaltyPercentage));
-                Console.WriteLine($"Order {order.Id} delivered late. Original Value: {order.Value}, Value after penalty: {valueAfterPenalty}");
+                int valueAfterPenalty = (int)(value * (1 - penaltyPercentage));
+                _logger.LogInformation($"Order delivered late. Original Value: {value}, Value after penalty: {valueAfterPenalty}");
                 return valueAfterPenalty;
             }
         }
@@ -239,6 +373,4 @@ namespace SimBackend.Services
             return _coinUpdates;
         }
     }
-
-   
 }

@@ -1,6 +1,5 @@
 ﻿using System.Text;
-using System.Text.Json;
-using SimBackend.Model.DTO;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -8,7 +7,7 @@ namespace SimBackend.Services
 {
     public interface IRabbitMqService
     {
-        void Subscribe(Action<OrderDto> handleOrder);
+        void Subscribe(Action<string> handleOrder);
     }
 
     public class RabbitMqService : IRabbitMqService
@@ -17,37 +16,30 @@ namespace SimBackend.Services
         private readonly string _queueName = "HahnCargoSim_NewOrders";
         private readonly IConnection _connection;
         private readonly IModel _channel;
+        private readonly ILogger<RabbitMqService> _logger;
 
-        public RabbitMqService()
+        public RabbitMqService(ILogger<RabbitMqService> logger)
         {
+            _logger = logger;
             var factory = new ConnectionFactory { HostName = _hostname };
             _connection = factory.CreateConnection();
             _channel = _connection.CreateModel();
             _channel.QueueDeclare(_queueName, false, false, false, null);
-            Console.WriteLine("RabbitMqService is initialized.");
+            _logger.LogInformation("RabbitMqService is initialized.");
         }
 
-        public void Subscribe(Action<OrderDto> handleOrder)
+        public void Subscribe(Action<string> handleOrder)
         {
             var consumer = new EventingBasicConsumer(_channel);
             consumer.Received += (model, ea) =>
             {
                 var body = ea.Body.ToArray();
                 var json = Encoding.UTF8.GetString(body);
-                Console.WriteLine($"Raw message received: {json}");
-                var order = JsonSerializer.Deserialize<OrderDto>(json);
-
-                if (order == null)
-                {
-                    Console.WriteLine("Error: Failed to deserialize order.");
-                }
-                else
-                {
-                    handleOrder(order);
-                }
+                _logger.LogInformation($"Raw message received: {json}");
+                handleOrder(json);
             };
             _channel.BasicConsume(_queueName, true, consumer);
-            Console.WriteLine("Subscribed to queue.");
+            _logger.LogInformation("Subscribed to queue.");
         }
     }
 }
