@@ -163,7 +163,14 @@ namespace SimBackend.Services
             var currentPos = transporter.PositionNodeId;
             _logger.LogInformation($"Current position of transporter {transporterId}: {currentPos}");
 
-            var path = await GetPath(currentPos, targetNodeId);
+            var gridObject = await GetGridData();
+            if (gridObject == null)
+            {
+                _logger.LogError("Failed to get grid data.");
+                return false;
+            }
+
+            var path = FindShortestPathByTime(gridObject, currentPos, targetNodeId);
             if (path.Count == 0)
             {
                 _logger.LogError($"No path found from node {currentPos} to node {targetNodeId}");
@@ -198,27 +205,29 @@ namespace SimBackend.Services
 
 
 
-        private List<int> Dijkstra(Grid grid, int startNodeId, int endNodeId)
+
+
+        private List<int> FindShortestPathByTime(Grid grid, int startNodeId, int endNodeId)
         {
             var nodes = grid.Nodes.ToDictionary(n => n.Id, n => n);
             var connections = grid.Connections.GroupBy(c => c.FirstNodeId)
                                               .ToDictionary(g => g.Key, g => g.ToList());
 
-            var distances = new Dictionary<int, int>();
+            var times = new Dictionary<int, TimeSpan>();
             var previousNodes = new Dictionary<int, int>();
             var unvisitedNodes = new HashSet<int>();
 
             foreach (var node in nodes.Keys)
             {
-                distances[node] = int.MaxValue;
+                times[node] = TimeSpan.MaxValue;
                 unvisitedNodes.Add(node);
             }
 
-            distances[startNodeId] = 0;
+            times[startNodeId] = TimeSpan.Zero;
 
             while (unvisitedNodes.Count > 0)
             {
-                var currentNode = unvisitedNodes.OrderBy(n => distances[n]).First();
+                var currentNode = unvisitedNodes.OrderBy(n => times[n]).First();
                 unvisitedNodes.Remove(currentNode);
 
                 if (currentNode == endNodeId)
@@ -239,10 +248,10 @@ namespace SimBackend.Services
                             continue;
                         }
 
-                        var newDist = distances[currentNode] + edge.Cost;
-                        if (newDist < distances[neighbor])
+                        var newTime = times[currentNode] + edge.Time;
+                        if (newTime < times[neighbor])
                         {
-                            distances[neighbor] = newDist;
+                            times[neighbor] = newTime;
                             previousNodes[neighbor] = currentNode;
                         }
                     }
@@ -269,17 +278,18 @@ namespace SimBackend.Services
         }
 
 
-        private async Task<List<int>> GetPath(int startNodeId, int endNodeId)
+
+
+        private async Task<Grid> GetGridData()
         {
             var gridResponse = await _httpClient.GetAsync("https://localhost:7115/Grid/Get");
             if (!gridResponse.IsSuccessStatusCode)
             {
                 _logger.LogError($"Failed to get grid data. Status code: {gridResponse.StatusCode}");
-                return new List<int>();
+                return null;
             }
 
             var gridContent = await gridResponse.Content.ReadAsStringAsync();
-
             JsonNode? grid;
             try
             {
@@ -288,13 +298,13 @@ namespace SimBackend.Services
             catch (Exception ex)
             {
                 _logger.LogError($"Error parsing grid JSON: {ex.Message}");
-                return new List<int>();
+                return null;
             }
 
             if (grid == null)
             {
                 _logger.LogError("Error: Grid JSON is null.");
-                return new List<int>();
+                return null;
             }
 
             var nodesJson = grid["Nodes"]?.AsArray();
@@ -306,7 +316,7 @@ namespace SimBackend.Services
                 if (nodesJson == null) _logger.LogError("Error: Missing nodes in the grid JSON.");
                 if (edgesJson == null) _logger.LogError("Error: Missing edges in the grid JSON.");
                 if (connectionsJson == null) _logger.LogError("Error: Missing connections in the grid JSON.");
-                return new List<int>();
+                return null;
             }
 
             var gridObject = new Grid
@@ -319,6 +329,7 @@ namespace SimBackend.Services
                 {
                     Id = edge["Id"]?.GetValue<int>() ?? -1,
                     Cost = edge["Cost"]?.GetValue<int>() ?? -1,
+                    Time = TimeSpan.Parse(edge["Time"]?.GetValue<string>() ?? "00:00:00"),
                 }).Where(e => e.Id != -1 && e.Cost != -1).ToList(),
                 Connections = connectionsJson.Select(conn => new Connection
                 {
@@ -330,11 +341,8 @@ namespace SimBackend.Services
 
             _logger.LogInformation($"Deserialized Grid: Nodes={gridObject.Nodes.Count}, Edges={gridObject.Edges.Count}, Connections={gridObject.Connections.Count}");
 
-            return Dijkstra(gridObject, startNodeId, endNodeId);
+            return gridObject;
         }
-
-
-
 
 
 
